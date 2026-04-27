@@ -7,7 +7,6 @@ import chromadb
 from pypdf import PdfReader
 
 # ========== 配置 ==========
-# 临时方案：直接写死你的 API Key（部署后可以改成 st.secrets）
 API_KEY = st.secrets["API_KEY"]
 BASE_URL = st.secrets["BASE_URL"]
 EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
@@ -79,30 +78,71 @@ def get_or_create_collection(pdf_path, persist_dir="./chroma_db"):
             collection.add(ids=[str(i)], embeddings=[emb], documents=[chunk])
         return collection, True
 
-def ask(collection, query, top_k=2):
+# ========== 升级版 ask 函数：返回答案 + 来源 ==========
+def ask_with_source(collection, query, history=None, top_k=2):
+    """
+    检索相关片段，结合历史对话生成答案，并返回答案和来源
+    """
+    # 1. 将问题向量化
     q_emb = get_embedding(query)
+    # 2. 检索最相关的 top_k 个片段
     results = collection.query(query_embeddings=[q_emb], n_results=top_k)
     chunks = results['documents'][0]
-    context = "\n\n".join(chunks)
-    prompt = f"""根据下列资料回答问题。如果资料中没有相关信息，请明确回答“资料中没有提到”。
+    
+    # 3. 构建上下文
+    context = "\n\n---\n\n".join(chunks)
+    
+    # 4. 构建提示词（如果有历史对话，也加进去）
+    prompt = f"""你是一个专业的文档问答助手。请根据以下参考资料回答用户的问题。
+如果参考资料中没有相关信息，请明确回答“资料中没有提到”。
 
 参考资料：
 {context}
 
-问题：{query}
+"""
+    if history:
+        prompt += "\n对话历史：\n"
+        for item in history:
+            prompt += f"用户：{item['user']}\n助手：{item['assistant']}\n"
+    
+    prompt += f"""
+用户当前问题：{query}
 答案："""
+    
+    # 5. 调用大模型
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
-    return resp.choices[0].message.content
+    answer = resp.choices[0].message.content
+    
+    # 6. 处理来源（用于显示）
+    sources = []
+    for idx, chunk in enumerate(chunks):
+        preview = chunk[:200] + "..." if len(chunk) > 200 else chunk
+        sources.append({
+            "index": idx + 1,
+            "preview": preview,
+            "full": chunk
+        })
+    
+    return answer, sources
 
 # ========== Streamlit UI ==========
 st.set_page_config(page_title="📄 PDF智能问答助手", layout="wide")
 st.title("📚 PDF 智能问答系统")
-st.markdown("上传你的PDF文档，然后像聊天一样提问，AI会从文档中寻找答案。")
+st.markdown("上传你的PDF文档，然后像聊天一样提问，AI会从文档中寻找答案，并支持追问。")
 
+# 初始化会话状态
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "history" not in st.session_state:
+    st.session_state.history = []  # 存储对话历史（用于上下文）
+if "sources" not in st.session_state:
+    st.session_state.sources = {}  # 存储每条消息对应的来源
+
+# 侧边栏
 with st.sidebar:
     st.header("⚙️ 控制台")
     uploaded_file = st.file_uploader("上传 PDF 文件", type=["pdf"])
@@ -126,26 +166,62 @@ with st.sidebar:
     else:
         st.info("👈 请从左侧上传一个PDF文件开始。")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for msg in st.session_state.messages:
+# 显示聊天记录（带来源折叠）
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        # 如果是助手消息且有来源，显示来源（可折叠）
+        if msg["role"] == "assistant" and idx in st.session_state.sources:
+            sources = st.session_state.sources[idx]
+            with st.expander("📖 查看答案来源"):
+                for src in sources:
+                    st.markdown(f"**片段 {src['index']}**：")
+                    st.text(src['preview'])
 
+# 底部输入框
 if prompt := st.chat_input("在这里输入你的问题"):
+    # 检查是否已上传PDF
     if "collection" not in st.session_state or st.session_state["collection"] is None:
         st.warning("请先在左侧上传一个PDF文件。")
         st.stop()
+    
+    # 显示用户问题
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # 生成回答
     with st.chat_message("assistant"):
-        with st.spinner("正在思考答案..."):
+        with st.spinner("正在从文档中查找答案..."):
             try:
-                answer = ask(st.session_state["collection"], prompt)
+                # 调用升级版函数，传入历史对话
+                answer, sources = ask_with_source(
+                    st.session_state["collection"], 
+                    prompt, 
+                    history=st.session_state.history
+                )
                 st.markdown(answer)
+                
+                # 保存消息和来源
+                msg_idx = len(st.session_state.messages)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.session_state.sources[msg_idx] = sources
+                
+                # 更新对话历史（用于下次提问的上下文）
+                st.session_state.history.append({
+                    "user": prompt,
+                    "assistant": answer
+                })
+                # 只保留最近 5 轮对话，避免超出上下文
+                if len(st.session_state.history) > 5:
+                    st.session_state.history.pop(0)
+                
+                # 显示来源（可折叠）
+                if sources:
+                    with st.expander("📖 查看答案来源"):
+                        for src in sources:
+                            st.markdown(f"**片段 {src['index']}**：")
+                            st.text(src['preview'])
             except Exception as e:
                 err_msg = f"生成答案时出错：{e}"
                 st.error(err_msg)
