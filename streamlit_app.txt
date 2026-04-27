@@ -2,3 +2,4 @@ streamlit
 openai
 chromadb
 pypdf
+httpx
