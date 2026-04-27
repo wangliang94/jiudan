@@ -8,8 +8,8 @@ from pypdf import PdfReader
 
 # ========== 配置 ==========
 # 临时方案：直接写死你的 API Key（部署后可以改成 st.secrets）
-API_KEY = "sk-dezodooqbjvqbiihqujifkiqznmahtarwrrgybvwndqxqwja"   # 替换成真实密钥
-BASE_URL = "https://api.siliconflow.cn/v1"
+API_KEY = st.secrets["API_KEY"]
+BASE_URL = st.secrets["BASE_URL"]
 EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
 CHAT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
